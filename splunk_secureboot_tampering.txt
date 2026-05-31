@@ -1,0 +1,203 @@
+```spl
+### Splunk Query Pack – Secure Boot & Firmware Persistence Monitoring
+### Author: GGSEC Research GG Advanced IT Security GGSec.de| Maciej Gojny
+### Version: 3.0 FINAL
+### Date: 2026-05-31
+### Classification: TLP:WHITE
+### License: CC BY 4.0 (Creative Commons Attribution 4.0 International)
+###
+### Description:
+### Detection and hunting queries focused on:
+### - Secure Boot tampering
+### - Firmware persistence indicators
+### - Boot-chain anomalies
+### - BitLocker / TPM integrity events
+### - Unsigned EFI and kernel driver activity
+###
+### Operational Notes:
+### - Event IDs and field mappings may vary depending on:
+###     * Windows version
+###     * OEM firmware implementation
+###     * SIEM normalization
+###     * Sysmon configuration
+### - SignatureStatus availability depends on telemetry enrichment.
+### - Queries are intended for enterprise SOC / DFIR workflows.
+###
+### ============================================================
+### QUERY 1 – Secure Boot / TPM / BitLocker State Changes
+### ============================================================
+
+
+index=windows sourcetype=WinEventLog:System
+| search EventID=1035 OR EventID=12 OR EventID=13
+| eval change_detail=coalesce(Param1, Param2, Param3, Message, "unknown")
+| where match(change_detail, "(?i)(SecureBoot|BitLocker|TPM|HVCI|Memory Integrity)")
+| rex field=change_detail "(?i)(?<changed_setting>SecureBoot|BitLocker|TPM|HVCI|Memory Integrity)\s*(?<changed_state>disabled|enabled|deactivated|activated|tampered|modified)?"
+| eval severity=case(
+    match(change_detail, "(?i)disabled") AND match(change_detail, "(?i)SecureBoot"), "CRITICAL",
+    match(change_detail, "(?i)deactivated") AND match(change_detail, "(?i)BitLocker"), "HIGH",
+    match(change_detail, "(?i)tampered"), "CRITICAL",
+    match(change_detail, "(?i)revoked"), "HIGH",
+    match(change_detail, "(?i)modified"), "MEDIUM",
+    1=1, "INFO"
+)
+| eval risk_score=case(
+    severity="CRITICAL", 90,
+    severity="HIGH", 70,
+    severity="MEDIUM", 50,
+    severity="INFO", 20
+)
+| table _time, host, ComputerName, EventID, changed_setting, changed_state, severity, risk_score, change_detail
+| sort - _time
+
+### ============================================================
+### QUERY 2 – Suspicious System Time Changes
+### Often associated with Secure Boot bypass preparation
+### ============================================================
+
+index=windows sourcetype=WinEventLog:Security EventID=4616
+| eval old_time=coalesce(PreviousTime, "unknown")
+| eval new_time=coalesce(NewTime, "unknown")
+| eval old_epoch=if(old_time!="unknown", strptime(old_time, "%Y-%m-%dT%H:%M:%S.%N%Z"), null())
+| eval new_epoch=if(new_time!="unknown", strptime(new_time, "%Y-%m-%dT%H:%M:%S.%N%Z"), null())
+| where isnotnull(old_epoch) AND isnotnull(new_epoch)
+| eval time_delta=abs(new_epoch-old_epoch)
+| where time_delta > 300
+| eval severity=case(
+    time_delta > 3600, "HIGH",
+    time_delta > 900, "MEDIUM",
+    1=1, "LOW"
+)
+| table _time, host, ComputerName, old_time, new_time, time_delta, severity, ProcessName, UserName
+| sort - time_delta
+
+### ============================================================
+### QUERY 3 – Boot Integrity & Secure Boot Kernel Events
+### ============================================================
+
+index=windows (
+    sourcetype="Microsoft-Windows-Kernel-Boot/Operational"
+    OR sourcetype="Microsoft-Windows-Kernel-General"
+)
+| eval description=coalesce(EventData, Message, "unknown")
+| where match(description, "(?i)(SecureBoot|integrity|tamper|failed|untrusted|revoked|bootmgfw|DBX)")
+| eval severity=case(
+    match(description, "(?i)tamper|failed|revoked|untrusted"), "HIGH",
+    1=1, "MEDIUM"
+)
+| table _time, host, ComputerName, EventID, TaskDisplayName, severity, description
+| sort - _time
+
+### ============================================================
+### QUERY 4 – Code Integrity Violations / Unsigned Drivers
+### Detects post-boot persistence commonly associated with bootkits
+### ============================================================
+
+index=windows sourcetype="Microsoft-Windows-CodeIntegrity/Operational"
+| search EventID=3001 OR EventID=3002 OR EventID=3077
+| eval signature_status=coalesce(SignatureStatus, "unknown")
+| eval driver_details=coalesce(DriverName, ModuleName, FileName, "unknown")
+| where signature_status!="Signed"
+| eval severity=case(
+    signature_status="unsigned", "CRITICAL",
+    signature_status="error", "HIGH",
+    1=1, "MEDIUM"
+)
+| table _time, host, ComputerName, EventID, signature_status, severity, driver_details
+| sort - _time
+
+### ============================================================
+### QUERY 5 – EFI System Partition (ESP) Modification Events
+### Sysmon-based monitoring aligned with Sigma detection logic
+### ============================================================
+
+index=windows sourcetype="XmlWinEventLog" EventID=11
+| where TargetFilename LIKE "%\\EFI\\%"
+| where lower(TargetFilename) LIKE "%.efi"
+| where SignatureStatus IN ("unsigned", "error")
+| where NOT Image LIKE "%\\Windows\\System32\\svchost.exe"
+| where NOT Image LIKE "%\\Windows\\System32\\dism.exe"
+| eval severity="HIGH"
+| table _time, host, ComputerName, TargetFilename, SignatureStatus, severity, Image, User
+| sort - _time
+
+### ============================================================
+### QUERY 6 – Correlated Firmware Persistence Indicators
+### Multi-signal hunting query
+### ============================================================
+
+(
+    index=windows sourcetype=WinEventLog:System EventID=1035
+)
+OR
+(
+    index=windows sourcetype="XmlWinEventLog" EventID=11 TargetFilename="*\\EFI\\*"
+)
+OR
+(
+    index=windows sourcetype="Microsoft-Windows-CodeIntegrity/Operational"
+)
+
+| eval indicator_type=case(
+    like(TargetFilename, "%\\EFI\\%"), "EFI Modification",
+    EventID=1035, "Secure Boot Change",
+    sourcetype="Microsoft-Windows-CodeIntegrity/Operational", "Code Integrity",
+    1=1, "Other"
+)
+
+| stats count values(indicator_type) as indicators values(host) as affected_hosts by ComputerName
+| where count >= 2
+
+### ============================================================
+### DASHBOARD SUMMARY – Critical Firmware Security Events
+### Last 24 Hours
+### ============================================================
+
+index=windows earliest=-24h
+(
+    sourcetype=WinEventLog:System
+    OR sourcetype="Microsoft-Windows-CodeIntegrity/Operational"
+    OR sourcetype="Microsoft-Windows-Kernel-Boot/Operational"
+)
+
+| eval event_type=case(
+    match(_raw, "(?i)SecureBoot"), "SecureBoot",
+    match(_raw, "(?i)BitLocker"), "BitLocker",
+    match(_raw, "(?i)TPM"), "TPM",
+    match(_raw, "(?i)HVCI"), "HVCI",
+    match(_raw, "(?i)CodeIntegrity"), "CodeIntegrity",
+    1=1, "Other"
+)
+
+| stats count by event_type, host
+| sort - count
+
+### ============================================================
+### ANALYST GUIDANCE
+### ============================================================
+###
+### High-confidence indicators:
+### - Secure Boot disabled unexpectedly
+### - Unsigned EFI binaries written to ESP
+### - CodeIntegrity violations involving unsigned drivers
+### - DBX revocation failures
+### - Multiple firmware-related anomalies on same host
+###
+### Recommended analyst actions:
+### - Acquire firmware image where possible
+### - Validate Secure Boot & TPM state
+### - Inspect EFI System Partition
+### - Run CHIPSEC integrity checks
+### - Verify DBX revocation status
+### - Investigate kernel driver loading chain
+###
+### Complementary telemetry:
+### - Sysmon Event ID 11
+### - Microsoft-Windows-CodeIntegrity/Operational
+### - Kernel-Boot Operational logs
+### - TPM-WMI logs
+### - EDR firmware telemetry
+###
+### END OF FILE
+### ============================================================
+```
