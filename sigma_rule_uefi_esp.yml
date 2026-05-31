@@ -1,0 +1,76 @@
+title: Suspicious Unsigned EFI Binary Written to ESP
+id: 6f2f9b0e-6d8e-4e52-9d1f-bf9d7b1b5a77
+status: experimental
+description: |
+    Detects potentially malicious unsigned EFI binaries written to the
+    EFI System Partition (ESP). This activity may indicate firmware
+    persistence attempts, bootkit deployment, or unauthorized boot-chain
+    modification.
+references:
+    - https://attack.mitre.org/techniques/T1542/003/
+    - https://securelist.com/moonbounce-the-dark-side-of-uefi-firmware/105468/
+    - https://www.welivesecurity.com/2018/09/27/lojax-first-uefi-rootkit-found-wild/
+    - https://www.huntress.com/blog/blacklotus-toujours-lamour
+author: GGSEC Research - GG Advanced It Security 
+date: 2026-05-31
+modified: 2026-05-31
+logsource:
+    product: windows
+    service: sysmon
+    definition: |
+        Requires Sysmon Event ID 11 (FileCreate) logging enabled.
+        SignatureStatus field availability depends on Sysmon configuration.
+detection:
+    selection_event:
+        EventID: 11
+    
+    selection_efi_paths:
+        TargetFilename|contains:
+            - '\EFI\Microsoft\Boot\'
+            - '\EFI\Boot\'
+            - '\EFI\OEM\'
+    
+    selection_efi_extension:
+        TargetFilename|endswith: '.efi'
+    
+    selection_unsigned:
+        SignatureStatus:
+            - 'unsigned'
+            - 'error'
+    
+    filter_legitimate_processes:
+        Image|contains:
+            - '\Windows\System32\svchost.exe'
+            - '\Windows\System32\dism.exe'
+    
+    filter_known_update_tools:
+        Image|contains:
+            - 'Lenovo'
+            - 'Dell'
+            - 'HP'
+            - 'fwupdate'
+            - 'FirmwareUpdate'
+    
+    condition: selection_event and (selection_efi_paths or selection_efi_extension) and selection_unsigned and not filter_legitimate_processes and not filter_known_update_tools
+fields:
+    - TargetFilename
+    - Image
+    - User
+    - Hashes
+    - Signature
+    - SignatureStatus
+    - ProcessGuid
+    - ProcessId
+falsepositives:
+    - Legitimate OEM firmware update utilities
+    - Enterprise provisioning software
+    - Authorized EFI bootloader deployment
+    - Operating system upgrade procedures
+level: high
+tags:
+    - attack.persistence
+    - attack.defense-evasion
+    - attack.privilege-escalation
+    - attack.t1542.003
+    - attack.t1068
+    - attack.t1542
