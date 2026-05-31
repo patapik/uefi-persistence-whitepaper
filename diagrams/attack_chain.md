@@ -1,6 +1,3 @@
-```markdown
-# Firmware Persistence Attack Chain
-
 ```mermaid
 flowchart LR
     subgraph "Phase 1: Initial Access"
